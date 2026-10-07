@@ -31,23 +31,82 @@ hesitation, self-correction). The pipeline therefore looks at each clip in three
 each, and combines them.
 
 ```
-                         audio clip (16 kHz)
-                                │
-     preprocessing: silence trim, normalisation, speaker clusters, zero-score detector
-        ┌───────────────────────┼─────────────────────────┐
-        ▼                       ▼                         ▼
-   AUDIO VIEWS             TRANSCRIPT VIEWS           RUBRIC SIGNALS
-   WavLM-large             Whisper large-v3,          LanguageTool, GPT-2 surprisal,
-   Whisper-L3 encoder      prompted to keep           CoLA acceptability,
-   w2v-BERT 2.0            fillers and errors         LLM judges (Qwen2.5-7B, Qwen3-14B),
-   Qwen2-Audio-7B          RoBERTa-large, LLM states  CoEdIT corrections, CTC vs Whisper
-        └───────────────────────┼─────────────────────────┘
-                                ▼
-       Ridge / SVR / ordinal heads per view, speaker-grouped 5-fold CV × 3 seeds
-                                ▼
-                 non-negative linear stacking of out-of-fold predictions
-                                ▼
-          speaker prior for known speakers, zero-score clips → 0 → submission.csv
+ ┌──────────────────────────────────────────────────────────────────────────────────────────────┐
+ │ INPUT   985 spoken answers, 45-60 s, 16 kHz mono                                             │
+ │         769 training clips with MOS grammar labels (0-5)  +  216 test clips                  │
+ └──────────────────────────────────────────────────────────────────────────────────────────────┘
+                                                 │
+                                                 ▼
+ ┌──────────────────────────────────────────────────────────────────────────────────────────────┐
+ │ 1  PREPROCESSING AND DATA CHECKS                                                             │
+ │    DC removal -> silence trim (35 dB) -> peak normalisation                                  │
+ │    speaker x-vectors -> 486 speaker clusters      => CV groups + speaker prior (step 5)      │
+ │    37 clips labelled 0 = separate recording batch => kept out of regression, own detector    │
+ └──────────────────────────────────────────────────────────────────────────────────────────────┘
+                                                 │
+                ┌────────────────────────────────┼────────────────────────────────┐
+                ▼                                ▼                                ▼
+ ┌────────────────────────────┐   ┌────────────────────────────┐   ┌────────────────────────────┐
+ │ 2a AUDIO VIEWS             │   │ 2b TRANSCRIPT VIEWS        │   │ 2c RUBRIC SIGNALS (59)     │
+ │    how it is said          │   │    what is said            │   │    interpretable evidence  │
+ │                            │   │                            │   │                            │
+ │ WavLM-large                │   │ Whisper large-v3 ASR,      │   │ fluency: rate, pauses, um  │
+ │ Whisper large-v3 encoder   │   │ verbatim prompt keeps      │   │ LanguageTool error rate    │
+ │ w2v-BERT 2.0               │   │ fillers and errors         │   │ GPT-2 surprisal, CoLA      │
+ │ Qwen2-Audio-7B (4-bit)     │   │  -> RoBERTa-large          │   │ CoEdIT corrections/word    │
+ │                            │   │  -> Qwen2.5-7B states      │   │ CTC vs Whisper distance    │
+ │ mean + std pooling of      │   │  -> Qwen3-14B states       │   │ LLM judges P(score 1..5):  │
+ │ every layer over time      │   │ mean pooling, every layer  │   │  Qwen2.5-7B (zero-shot)    │
+ │                            │   │                            │   │  Qwen3-14B (4 anchors)     │
+ └────────────────────────────┘   └────────────────────────────┘   └────────────────────────────┘
+                │                                │                                │
+    best layer / window (CV)         best layer / window (CV)                     │
+                │                                │                                │
+                └────────────────────────────────┼────────────────────────────────┘
+                                                 ▼
+ ┌──────────────────────────────────────────────────────────────────────────────────────────────┐
+ │ 3  BASE MODELS   7 embedding views x {Ridge, SVR (tuned C), ordinal head, KNN} = 28          │
+ │                  + rubric signals x {Ridge, gradient boosting, ordinal head}  = 3  -> 31     │
+ │    speaker-grouped stratified 5-fold CV x 3 seeds -> out-of-fold predictions                 │
+ │    (a speaker is never in training and validation of the same fold)                          │
+ └──────────────────────────────────────────────────────────────────────────────────────────────┘
+                                                 │
+                                                 ▼
+ ┌──────────────────────────────────────────────────────────────────────────────────────────────┐
+ │ 4  STACKING      non-negative linear regression on the 31 out-of-fold predictions            │
+ │    chosen over Caruana ensemble selection by nested CV; calibration check: none needed       │
+ └──────────────────────────────────────────────────────────────────────────────────────────────┘
+                                                 │
+                                                 ▼
+ ┌──────────────────────────────────────────────────────────────────────────────────────────────┐
+ │ 5  POST-PROCESSING                                                                           │
+ │    25 test clips of known speakers -> 0.55 x model + 0.45 x that speaker's mean score        │
+ │    zero-score detector (p > 0.8) -> 0   (37/37 found in CV, 0 flagged in test)               │
+ └──────────────────────────────────────────────────────────────────────────────────────────────┘
+                                                 │
+                                                 ▼
+ ┌──────────────────────────────────────────────────────────────────────────────────────────────┐
+ │ OUTPUT  submission.csv (216 rows)                                                            │
+ │         public LB RMSE 0.3416  |  CV RMSE 0.4983, Pearson 0.916  |  training RMSE 0.1223     │
+ └──────────────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Validation scheme
+
+```
+ 732 scored training clips ──► 486 speaker clusters (x-vector cosine similarity, threshold chosen from the labels)
+                                        │
+                                        ▼
+            StratifiedGroupKFold: 5 folds, stratified on the rounded score, grouped by speaker
+            fold 1   [  VAL  ][ train ][ train ][ train ][ train ]
+            fold 2   [ train ][  VAL  ][ train ][ train ][ train ]
+              ...       all clips of one speaker always fall in the same block
+            fold 5   [ train ][ train ][ train ][ train ][  VAL  ]
+                                        │   repeated with 3 seeds
+                                        ▼
+            every clip gets an out-of-fold prediction  ──►  CV RMSE / Pearson
+            the stacker is cross-validated again on the same folds (nested), so its weights never
+            see the clips they are scored on
 ```
 
 ### Key decisions
@@ -75,6 +134,15 @@ Audio encoders carry the most signal. The LLM judges and grammatical-error-corre
 interpretable signals: the Qwen3-14B judge, given the rubric and four scored example transcripts, reaches Spearman 0.68
 with the true score on its own. The main remaining error is at the low end: speakers scored 2 who speak fluently are often
 predicted around 2.5–3.
+
+## Iterations
+
+| Version | What changed | CV RMSE (scored) | Public LB |
+|---|---|---|---|
+| v1 | WavLM, Whisper encoder, Qwen2-Audio and RoBERTa embeddings + handcrafted grammar/fluency features, Ridge/SVR, non-negative stacking, speaker-grouped CV, zero-score detector | 0.5217 | 0.3515 |
+| v3 | + w2v-BERT 2.0, Qwen2.5-7B and Qwen3-14B rubric judges (with scored anchors), CoEdIT error-correction rate, CTC-vs-Whisper distance, layer windows, ordinal and KNN heads, tuned SVR, speaker prior, feature store | 0.5108 | **0.3416** |
+
+Every change was kept or dropped on the basis of speaker-grouped CV, never on the public leaderboard alone.
 
 ## Evaluation
 
