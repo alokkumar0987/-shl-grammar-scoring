@@ -1,0 +1,9 @@
+# competition data is not redistributed
+Dataset_Final/
+*.zip
+*.wav
+# local caches
+features/
+cache*/
+__pycache__/
+.ipynb_checkpoints/

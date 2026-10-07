@@ -1,0 +1,14 @@
+torch
+transformers>=5.0
+faster-whisper
+bitsandbytes
+librosa
+soundfile
+language_tool_python
+scikit-learn
+scipy
+numpy
+pandas
+matplotlib
+seaborn
+tqdm
